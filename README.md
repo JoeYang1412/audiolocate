@@ -17,9 +17,15 @@ An audio fingerprint matching engine based on the algorithm proposed in Wang (20
 ## Installation
 
 ```bash
+pip install audiolocate
+```
+
+Or install from source:
+
+```bash
 git clone https://github.com/JoeYang1412/audiolocate.git
 cd audiolocate
-pip install -r requirements.txt
+pip install .
 ```
 
 ## Quick Start

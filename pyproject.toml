@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "audiolocate"
-version = "0.1.0"
+version = "0.1.1"
 authors = [
   { name = "JoeYang1412", email = "float_pulses1o@icloud.com" },
 ]

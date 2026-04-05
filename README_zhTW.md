@@ -15,9 +15,15 @@
 ## 安裝
 
 ```bash
+pip install audiolocate
+```
+
+或從原始碼安裝：
+
+```bash
 git clone https://github.com/JoeYang1412/audiolocate.git
 cd audiolocate
-pip install -r requirements.txt
+pip install .
 ```
 
 ## 快速開始
