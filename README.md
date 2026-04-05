@@ -1,6 +1,6 @@
 # audiolocate
 
-> *This document was AI-translated from the [Traditional Chinese original](https://github.com/JoeYang1412/audiolocate/blob/main/README_zhTW.md).*
+> *This document was AI-translated from the [Traditional Chinese original](https://github.com/JoeYang1412/audiolocate/blob/master/README_zhTW.md).*
 
 An audio fingerprint matching engine based on the algorithm proposed in Wang (2003) "An Industrial-Strength Audio Search Algorithm." Given a short audio sample and a long reference audio, it determines whether the sample appears in the reference audio and returns the precise time offset.
 
