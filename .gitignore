@@ -1,3 +1,6 @@
 __pycache__
 test.py
 .devcontainer
+dist/
+*.egg-info/
+.venv/
