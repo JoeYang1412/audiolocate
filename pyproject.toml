@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools >= 78.1.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "audiolocate"
+version = "0.1.0"
+authors = [
+  { name = "JoeYang1412", email = "float_pulses1o@icloud.com" },
+]
+description = "Audio fingerprint search engine — find where a short audio clip appears within a long recording."
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Multimedia :: Sound/Audio :: Analysis",
+]
+license = "MIT"
+license-files = ["LICEN[CS]E*"]
+dependencies = [
+    "numpy",
+    "scipy",
+    "av",
+]
+
+[project.urls]
+Homepage = "https://github.com/JoeYang1412/audiolocate"
+Issues = "https://github.com/JoeYang1412/audiolocate/issues"
+
+[tool.setuptools.packages.find]
+include = ["audiolocate*"]   

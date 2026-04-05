@@ -36,7 +36,7 @@ class StreamMatcher(AudioFingerprint):
     # ── Fingerprinting (streaming) ──
 
     def fingerprint_source(
-        self, source: Union[str, pathlib.Path, IO[bytes]], chunk_seconds: int = 300, verbose: bool = True
+        self, source: Union[str, pathlib.Path, IO[bytes]], chunk_seconds: int = 300, verbose: bool = False
     ) -> dict:
         """Stream-decode an audio source and build fingerprint hash dictionary.
 
@@ -57,8 +57,7 @@ class StreamMatcher(AudioFingerprint):
         chunks_done = 0
         total_hashes = 0
 
-        if verbose:
-            print(f"[fingerprint] Building fingerprint: {source}")
+        print(f"[fingerprint] Building fingerprint: {source}")
 
         def _process_chunk(chunk_audio, sample_offset):
             nonlocal chunks_done, total_hashes
@@ -79,6 +78,8 @@ class StreamMatcher(AudioFingerprint):
                 print(f"  chunk {chunks_done} | pos {pos} | "
                       f"len {dur} | peaks {len(peaks)} | "
                       f"hashes +{chunk_hash_count} (total {total_hashes})")
+            else:
+                print(f"\r[fingerprint] Processing chunk {chunks_done} ...", end="", flush=True)
 
         for frame in container.decode(audio=0):
             resampled = resampler.resample(frame)
@@ -107,10 +108,11 @@ class StreamMatcher(AudioFingerprint):
 
         container.close()
 
-        if verbose:
-            print(f"[fingerprint] Done | {chunks_done} chunks | "
-                  f"{len(all_hashes)} unique hashes | "
-                  f"{total_hashes} total entries")
+        if not verbose:
+            print()
+        print(f"[fingerprint] Done | {chunks_done} chunks | "
+              f"{len(all_hashes)} unique hashes | "
+              f"{total_hashes} total entries")
 
         return dict(all_hashes)
 
@@ -193,7 +195,7 @@ class StreamMatcher(AudioFingerprint):
         short_source: Union[str, pathlib.Path, IO[bytes]],
         chunk_seconds: int = 300,
         early_exit: bool = True,
-        verbose: bool = True,
+        verbose: bool = False,
     ) -> dict:
         """Match a short sample against a long reference using streaming.
 
@@ -214,15 +216,14 @@ class StreamMatcher(AudioFingerprint):
         t_start = _time.monotonic()
 
         # Step 1: fingerprint the short (sample) audio in memory
-        if verbose:
-            print(f"[match] Loading sample: {short_source}")
+        print(f"[load] Loading sample: {short_source}")
         short_audio = self.load_audio(short_source)
         sample_duration = len(short_audio) / self.sr
         sample_hashes, _ = self.fingerprint_audio(short_audio)
         total_sample_hashes = sum(len(v) for v in sample_hashes.values())
         del short_audio  # free memory
         if verbose:
-            print(f"[match] Sample length {_format_time(sample_duration)} | "
+            print(f"[load] {_format_time(sample_duration)} | "
                   f"{len(sample_hashes)} unique hashes | "
                   f"{total_sample_hashes} total entries")
 
@@ -239,7 +240,7 @@ class StreamMatcher(AudioFingerprint):
 
         if verbose:
             source_name = getattr(long_source, 'name', str(long_source))
-            print(f"[match] Streaming match: {source_name} "
+            print(f"[scan] {source_name} "
                   f"(chunk={chunk_seconds}s, overlap={overlap_seconds}s, "
                   f"early_exit={early_exit})")
 
@@ -337,6 +338,8 @@ class StreamMatcher(AudioFingerprint):
             result, _ = self._match_chunk(
                 chunk_audio, sample_offset, sample_hashes, chunks_processed, verbose
             )
+            if not verbose:
+                print(f"\r[scan] Scanning chunk {chunks_processed} ...", end="", flush=True)
 
             best_count = best_result.match_count if best_result else -1
             if result is not None and result.match_count > best_count:
@@ -369,18 +372,26 @@ class StreamMatcher(AudioFingerprint):
 
         final = self._build_result(final_result, chunks_processed, early_stopped)
 
-        if verbose:
-            elapsed = _time.monotonic() - t_start
-            if final["found"]:
-                print(f"[match] Match found at "
+        if not verbose:
+            print()
+        elapsed = _time.monotonic() - t_start
+        if final["found"]:
+            if verbose:
+                print(f"[result] Match found at "
                       f"{_format_time(final['time_seconds'])} | "
                       f"count={final['match_count']} "
                       f"threshold={final['threshold']:.1f} | "
                       f"{chunks_processed} chunks | {elapsed:.1f}s")
             else:
-                print(f"[match] No match found | "
+                print(f"[result] Match found at "
+                      f"{_format_time(final['time_seconds'])} | {elapsed:.1f}s")
+        else:
+            if verbose:
+                print(f"[result] No match found | "
                       f"best count={final['match_count']} "
                       f"threshold={final['threshold']:.1f} | "
                       f"{chunks_processed} chunks | {elapsed:.1f}s")
+            else:
+                print(f"[result] No match found | {elapsed:.1f}s")
 
         return final
