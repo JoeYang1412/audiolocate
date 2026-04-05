@@ -2,7 +2,7 @@ import numpy as np
 from scipy.ndimage import maximum_filter
 from scipy.signal import stft as scipy_stft
 from collections import defaultdict, Counter
-from typing import NamedTuple, Dict, List, Tuple, Union
+from typing import IO, NamedTuple, Dict, List, Tuple, Union
 import pathlib
 
 
@@ -16,6 +16,13 @@ class MatchResult(NamedTuple):
 
 class AudioFingerprint:
     """Audio fingerprinting engine based on Wang 2003 (Shazam algorithm)."""
+
+    # ── Class Constants ──
+    MAX_OFFSETS_PER_HASH = 500
+    OFFSET_TOLERANCE = 2
+    MIN_NOISE_BINS = 10
+
+    # ── Initialization ──
 
     def __init__(
         self,
@@ -60,11 +67,16 @@ class AudioFingerprint:
         self.freq_mask = (1 << freq_bits) - 1
         self.dt_mask = (1 << dt_bits) - 1
 
-    def load_audio(self, path: str) -> np.ndarray:
-        """Load an audio file using PyAV, convert to mono float32 at self.sr."""
+    # ── Audio I/O ──
+
+    def load_audio(self, source: Union[str, pathlib.Path, IO[bytes]]) -> np.ndarray:
+        """Load an audio file using PyAV, convert to mono float32 at self.sr.
+
+        source can be a file path, URL, or file-like object.
+        """
         import av
 
-        container = av.open(str(path))
+        container = av.open(source if not isinstance(source, pathlib.Path) else str(source))
         resampler = av.AudioResampler(format="fltp", layout="mono", rate=self.sr)
         chunks = []
         for frame in container.decode(audio=0):
@@ -79,6 +91,8 @@ class AudioFingerprint:
         if not chunks:
             return np.array([], dtype=np.float32)
         return np.concatenate(chunks).astype(np.float32)
+
+    # ── Spectrogram ──
 
     def _compute_stft(self, audio: np.ndarray) -> np.ndarray:
         """Compute magnitude spectrogram using scipy.signal.stft.
@@ -97,7 +111,11 @@ class AudioFingerprint:
             boundary=None,
             padded=False,
         )
+        # Linear magnitude, not dB: the paper selects peaks by "highest amplitude",
+        # and linear scale preserves the relative ordering needed for top-K selection.
         return np.abs(Zxx).astype(np.float32)
+
+    # ── Peak Detection ──
 
     def detect_peaks(self, spectrogram: np.ndarray) -> List[Tuple[int, int]]:
         """Detect peaks in spectrogram using local maximum filter + density control.
@@ -137,6 +155,7 @@ class AudioFingerprint:
             k = min(self.peaks_per_block, len(block_slice))
             block_amps = amplitudes[block_slice]
             if k < len(block_slice):
+                # Select top-k peaks by amplitude (partial sort, faster than full sort)
                 top_k_local = np.argpartition(block_amps, -k)[-k:]
             else:
                 top_k_local = np.arange(len(block_slice))
@@ -150,6 +169,8 @@ class AudioFingerprint:
         peaks = list(zip(freq_bins[selected].tolist(), time_frames[selected].tolist()))
         peaks.sort(key=lambda p: (p[1], p[0]))
         return peaks
+
+    # ── Hash Generation ──
 
     def _pack_hash(self, f1: int, f2: int, dt: int) -> int:
         """Bit-pack (f1, f2, dt) into a 32-bit hash."""
@@ -204,6 +225,7 @@ class AudioFingerprint:
                 idx = idx[:fan]
             f2 = cand_f[idx]
             dt = times[js:je][idx] - times[i]
+            # Pack (anchor_freq, target_freq, delta_time) into 32-bit hash
             h = ((freqs[i] & freq_mask) << shift
                  | (f2 & freq_mask) << dt_bits
                  | (dt & dt_mask))
@@ -233,6 +255,8 @@ class AudioFingerprint:
         hashes = self.generate_hashes(peaks)
         return hashes, spectrogram.shape[1]
 
+    # ── Offset Evaluation ──
+
     def _evaluate_offsets(self, offset_counts: dict) -> MatchResult:
         """Evaluate offset histogram with adaptive threshold (spec §2.3)."""
         if not offset_counts:
@@ -242,14 +266,13 @@ class AudioFingerprint:
         best_count = offset_counts[best_offset]
 
         # Noise bins: exclude best offset ± tolerance
-        tolerance = 2
         noise_counts = [
             c
             for off, c in offset_counts.items()
-            if abs(off - best_offset) > tolerance
+            if abs(off - best_offset) > self.OFFSET_TOLERANCE
         ]
 
-        if len(noise_counts) >= 10:
+        if len(noise_counts) >= self.MIN_NOISE_BINS:
             noise_mean = float(np.mean(noise_counts))
             noise_std = float(np.std(noise_counts))
             noise_max = float(max(noise_counts))
@@ -266,6 +289,8 @@ class AudioFingerprint:
         is_match = best_count > threshold
         return MatchResult(is_match, best_offset, best_count, threshold, noise_mean)
 
+    # ── Matching ──
+
     def match(
         self,
         db_hashes: Dict[int, List[int]],
@@ -277,13 +302,14 @@ class AudioFingerprint:
         Uses numpy broadcasting to vectorize pairwise offset computation.
         """
         all_deltas = []
-        for h, s_offs in sample_hashes.items():
-            d_offs = db_hashes.get(h)
+        for hash_key, s_offs in sample_hashes.items():
+            d_offs = db_hashes.get(hash_key)
             if d_offs is None:
                 continue
-            d = np.array(d_offs[:500], dtype=np.int64)
-            s = np.array(s_offs[:500], dtype=np.int64)
-            all_deltas.append((d[:, None] - s[None, :]).ravel())
+            db_arr = np.array(d_offs[:self.MAX_OFFSETS_PER_HASH], dtype=np.int64)
+            sample_arr = np.array(s_offs[:self.MAX_OFFSETS_PER_HASH], dtype=np.int64)
+            # Pairwise differences: every db offset minus every sample offset
+            all_deltas.append((db_arr[:, None] - sample_arr[None, :]).ravel())
 
         if not all_deltas:
             return self._evaluate_offsets({})

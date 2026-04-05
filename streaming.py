@@ -4,6 +4,8 @@ import queue as _queue
 import time as _time
 import numpy as np
 from collections import defaultdict, Counter
+from typing import IO, Union
+import pathlib
 
 from .core import AudioFingerprint, MatchResult
 
@@ -24,18 +26,27 @@ class StreamMatcher(AudioFingerprint):
     so that only one chunk of raw audio is in memory at a time.
     """
 
+    # ── Class Constants ──
+    CHUNK_QUEUE_SIZE = 2
+    QUEUE_PUT_TIMEOUT = 0.5
+    QUEUE_GET_TIMEOUT = 5
+    DECODER_JOIN_TIMEOUT = 10
+    SENTINEL_RETRY_COUNT = 10
+
+    # ── Fingerprinting (streaming) ──
+
     def fingerprint_source(
-        self, source: str, chunk_seconds: int = 300, verbose: bool = True
+        self, source: Union[str, pathlib.Path, IO[bytes]], chunk_seconds: int = 300, verbose: bool = True
     ) -> dict:
         """Stream-decode an audio source and build fingerprint hash dictionary.
 
-        source can be a file path or any URL accepted by av.open().
+        source can be a file path, URL, or file-like object accepted by av.open().
         Processes audio in chunks of chunk_seconds to bound memory usage.
         Returns dict mapping 32-bit hash -> list of global frame offsets.
         """
         import av
 
-        container = av.open(str(source))
+        container = av.open(source)
         resampler = av.AudioResampler(format="fltp", layout="mono", rate=self.sr)
 
         chunk_samples = int(chunk_seconds * self.sr)
@@ -47,7 +58,7 @@ class StreamMatcher(AudioFingerprint):
         total_hashes = 0
 
         if verbose:
-            print(f"[fingerprint] 開始建立指紋: {source}")
+            print(f"[fingerprint] Building fingerprint: {source}")
 
         def _process_chunk(chunk_audio, sample_offset):
             nonlocal chunks_done, total_hashes
@@ -65,9 +76,9 @@ class StreamMatcher(AudioFingerprint):
             if verbose:
                 pos = _format_time(sample_offset / self.sr)
                 dur = _format_time(len(chunk_audio) / self.sr)
-                print(f"  chunk {chunks_done} | 位置 {pos} | "
-                      f"長度 {dur} | peaks {len(peaks)} | "
-                      f"hashes +{chunk_hash_count} (累計 {total_hashes})")
+                print(f"  chunk {chunks_done} | pos {pos} | "
+                      f"len {dur} | peaks {len(peaks)} | "
+                      f"hashes +{chunk_hash_count} (total {total_hashes})")
 
         for frame in container.decode(audio=0):
             resampled = resampler.resample(frame)
@@ -97,26 +108,100 @@ class StreamMatcher(AudioFingerprint):
         container.close()
 
         if verbose:
-            print(f"[fingerprint] 完成 | {chunks_done} chunks | "
+            print(f"[fingerprint] Done | {chunks_done} chunks | "
                   f"{len(all_hashes)} unique hashes | "
                   f"{total_hashes} total entries")
 
         return dict(all_hashes)
 
+    # ── Chunk Matching ──
+
+    def _match_chunk(self, chunk_audio, sample_offset, sample_hashes, chunk_index, verbose):
+        """Fingerprint one chunk and match against sample hashes independently.
+
+        Returns (MatchResult, hits) or (None, 0) if chunk is too short.
+        """
+        if len(chunk_audio) < self.n_fft:
+            return None, 0
+
+        t_chunk_start = _time.monotonic()
+        spectrogram = self._compute_stft(chunk_audio)
+        peaks = self.detect_peaks(spectrogram)
+        chunk_hashes = self.generate_hashes(peaks)
+        frame_offset = sample_offset // self.hop_length
+
+        # Build independent offset histogram (spec §8.1)
+        all_deltas = []
+        for hash_key, chunk_offsets in chunk_hashes.items():
+            s_offs = sample_hashes.get(hash_key)
+            if s_offs is None:
+                continue
+            chunk_arr = np.array(chunk_offsets[:self.MAX_OFFSETS_PER_HASH], dtype=np.int64) + frame_offset
+            sample_arr = np.array(s_offs[:self.MAX_OFFSETS_PER_HASH], dtype=np.int64)
+            # Pairwise differences: every chunk offset minus every sample offset
+            all_deltas.append((chunk_arr[:, None] - sample_arr[None, :]).ravel())
+
+        if all_deltas:
+            concat = np.concatenate(all_deltas)
+            hits = len(concat)
+            chunk_offset_counts = Counter(concat.tolist())
+        else:
+            hits = 0
+            chunk_offset_counts = {}
+
+        result = self._evaluate_offsets(dict(chunk_offset_counts))
+
+        if verbose:
+            t_elapsed = _time.monotonic() - t_chunk_start
+            pos = _format_time(sample_offset / self.sr)
+            dur = _format_time(len(chunk_audio) / self.sr)
+            ratio = result.match_count / result.threshold if result.threshold > 0 else 0
+            status = "MATCH" if result.is_match else "---"
+            print(f"  chunk {chunk_index} | pos {pos} | "
+                  f"len {dur} | peaks {len(peaks)} | "
+                  f"hits {hits} | "
+                  f"best {result.match_count}/{result.threshold:.0f} "
+                  f"({ratio:.1f}x) {status} | "
+                  f"{t_elapsed:.1f}s")
+
+        return result, hits
+
+    def _build_result(
+        self, result, chunks_processed: int, early_stopped: bool
+    ) -> dict:
+        """Format the match result into an output dictionary."""
+        time_seconds = (
+            result.offset_frames * self.hop_length / self.sr
+            if result.is_match
+            else None
+        )
+        return {
+            "found": result.is_match,
+            "time_seconds": time_seconds,
+            "match_count": result.match_count,
+            "threshold": result.threshold,
+            "noise_baseline": result.noise_baseline,
+            "chunks_processed": chunks_processed,
+            "early_stopped": early_stopped,
+        }
+
+    # ── Streaming Pipeline ──
+
     def find_match_from_sources(
         self,
-        long_source: str,
-        short_source: str,
+        long_source: Union[str, pathlib.Path, IO[bytes]],
+        short_source: Union[str, pathlib.Path, IO[bytes]],
         chunk_seconds: int = 300,
         early_exit: bool = True,
         verbose: bool = True,
     ) -> dict:
         """Match a short sample against a long reference using streaming.
 
-        Both long_source and short_source can be file paths or any URL
-        accepted by av.open(). The short audio is fingerprinted entirely in
-        memory. The long audio is streamed chunk by chunk with a decode
-        thread pipelined against the processing thread. Each chunk builds
+        Both long_source and short_source can be file paths, URLs, or
+        file-like objects accepted by av.open(). The short audio is
+        fingerprinted entirely in memory. The long audio is streamed
+        chunk by chunk with a decode thread pipelined against the
+        processing thread. Each chunk builds
         an independent offset histogram and is evaluated independently
         (spec §2.3, §8.1). Adjacent chunks overlap by the sample duration
         to avoid boundary-splitting false negatives (spec §8.2).
@@ -130,14 +215,14 @@ class StreamMatcher(AudioFingerprint):
 
         # Step 1: fingerprint the short (sample) audio in memory
         if verbose:
-            print(f"[match] 載入樣本: {short_source}")
+            print(f"[match] Loading sample: {short_source}")
         short_audio = self.load_audio(short_source)
         sample_duration = len(short_audio) / self.sr
         sample_hashes, _ = self.fingerprint_audio(short_audio)
         total_sample_hashes = sum(len(v) for v in sample_hashes.values())
         del short_audio  # free memory
         if verbose:
-            print(f"[match] 樣本長度 {_format_time(sample_duration)} | "
+            print(f"[match] Sample length {_format_time(sample_duration)} | "
                   f"{len(sample_hashes)} unique hashes | "
                   f"{total_sample_hashes} total entries")
 
@@ -153,13 +238,14 @@ class StreamMatcher(AudioFingerprint):
             )
 
         if verbose:
-            print(f"[match] 開始串流比對: {long_source} "
+            source_name = getattr(long_source, 'name', str(long_source))
+            print(f"[match] Streaming match: {source_name} "
                   f"(chunk={chunk_seconds}s, overlap={overlap_seconds}s, "
                   f"early_exit={early_exit})")
 
         # Step 3: pipelined decode (thread) + process (main thread)
         # PyAV decode and numpy both release GIL, enabling true parallelism.
-        chunk_queue = _queue.Queue(maxsize=2)
+        chunk_queue = _queue.Queue(maxsize=self.CHUNK_QUEUE_SIZE)
         stop_event = threading.Event()
         decode_error = [None]  # mutable container for thread exception
 
@@ -167,7 +253,7 @@ class StreamMatcher(AudioFingerprint):
             """Put item into queue, retrying with timeout until success or stop."""
             while not stop_event.is_set():
                 try:
-                    chunk_queue.put(item, timeout=0.5)
+                    chunk_queue.put(item, timeout=self.QUEUE_PUT_TIMEOUT)
                     return True
                 except _queue.Full:
                     continue
@@ -176,7 +262,7 @@ class StreamMatcher(AudioFingerprint):
         def _decode_thread():
             """Producer: decode audio and emit overlapping chunks."""
             try:
-                container = av.open(str(long_source))
+                container = av.open(long_source)
                 resampler = av.AudioResampler(
                     format="fltp", layout="mono", rate=self.sr
                 )
@@ -196,9 +282,7 @@ class StreamMatcher(AudioFingerprint):
                         buf = np.concatenate(buf_parts)
                         chunk = buf[:chunk_samples]
                         remainder = buf[step_samples:]
-                        buf_parts = (
-                            [remainder] if len(remainder) > 0 else []
-                        )
+                        buf_parts = [remainder] if len(remainder) > 0 else []
                         buf_len = len(remainder)
                         if not _put((chunk, offset)):
                             break
@@ -221,68 +305,15 @@ class StreamMatcher(AudioFingerprint):
             finally:
                 # Sentinel must always be sent; use timeout to avoid deadlock
                 # if consumer is gone and queue is full.
-                for _ in range(10):
+                for _ in range(self.SENTINEL_RETRY_COUNT):
                     try:
-                        chunk_queue.put(None, timeout=0.5)
+                        chunk_queue.put(None, timeout=self.QUEUE_PUT_TIMEOUT)
                         break
                     except _queue.Full:
                         continue
 
         chunks_processed = 0
         best_result = None
-
-        def _process_chunk(chunk_audio, sample_offset):
-            """Consumer: fingerprint one chunk and match independently."""
-            nonlocal chunks_processed, best_result
-
-            if len(chunk_audio) < self.n_fft:
-                return None
-
-            t_chunk_start = _time.monotonic()
-            spectrogram = self._compute_stft(chunk_audio)
-            peaks = self.detect_peaks(spectrogram)
-            chunk_hashes = self.generate_hashes(peaks)
-            frame_offset = sample_offset // self.hop_length
-            chunks_processed += 1
-
-            # Build independent offset histogram (spec §8.1)
-            all_deltas = []
-            for h, chunk_offsets in chunk_hashes.items():
-                s_offs = sample_hashes.get(h)
-                if s_offs is None:
-                    continue
-                c = np.array(chunk_offsets[:500], dtype=np.int64) + frame_offset
-                s = np.array(s_offs[:500], dtype=np.int64)
-                all_deltas.append((c[:, None] - s[None, :]).ravel())
-
-            if all_deltas:
-                concat = np.concatenate(all_deltas)
-                hits = len(concat)
-                chunk_offset_counts = Counter(concat.tolist())
-            else:
-                hits = 0
-                chunk_offset_counts = {}
-
-            result = self._evaluate_offsets(dict(chunk_offset_counts))
-
-            if best_result is None or result.match_count > best_result.match_count:
-                best_result = result
-
-            t_chunk_elapsed = _time.monotonic() - t_chunk_start
-            if verbose:
-                pos = _format_time(sample_offset / self.sr)
-                dur = _format_time(len(chunk_audio) / self.sr)
-                ratio = (result.match_count / result.threshold
-                         if result.threshold > 0 else 0)
-                status = "MATCH" if result.is_match else "---"
-                print(f"  chunk {chunks_processed} | 位置 {pos} | "
-                      f"長度 {dur} | peaks {len(peaks)} | "
-                      f"hits {hits} | "
-                      f"best {result.match_count}/{result.threshold:.0f} "
-                      f"({ratio:.1f}x) {status} | "
-                      f"{t_chunk_elapsed:.1f}s")
-
-            return result
 
         # Start pipeline
         decoder = threading.Thread(target=_decode_thread, daemon=True)
@@ -293,7 +324,7 @@ class StreamMatcher(AudioFingerprint):
 
         while True:
             try:
-                item = chunk_queue.get(timeout=5)
+                item = chunk_queue.get(timeout=self.QUEUE_GET_TIMEOUT)
             except _queue.Empty:
                 # Decode thread may have died without sending sentinel
                 if not decoder.is_alive():
@@ -302,7 +333,14 @@ class StreamMatcher(AudioFingerprint):
             if item is None:
                 break
             chunk_audio, sample_offset = item
-            result = _process_chunk(chunk_audio, sample_offset)
+            chunks_processed += 1
+            result, _ = self._match_chunk(
+                chunk_audio, sample_offset, sample_hashes, chunks_processed, verbose
+            )
+
+            best_count = best_result.match_count if best_result else -1
+            if result is not None and result.match_count > best_count:
+                best_result = result
 
             if early_exit and result is not None and result.is_match:
                 match_result = result
@@ -316,7 +354,7 @@ class StreamMatcher(AudioFingerprint):
                         break
                 break
 
-        decoder.join(timeout=10)
+        decoder.join(timeout=self.DECODER_JOIN_TIMEOUT)
 
         # Re-raise decode thread exception if any
         if decode_error[0] is not None:
@@ -334,34 +372,15 @@ class StreamMatcher(AudioFingerprint):
         if verbose:
             elapsed = _time.monotonic() - t_start
             if final["found"]:
-                print(f"[match] 找到匹配！位於 "
+                print(f"[match] Match found at "
                       f"{_format_time(final['time_seconds'])} | "
                       f"count={final['match_count']} "
                       f"threshold={final['threshold']:.1f} | "
                       f"{chunks_processed} chunks | {elapsed:.1f}s")
             else:
-                print(f"[match] 未找到匹配 | "
+                print(f"[match] No match found | "
                       f"best count={final['match_count']} "
                       f"threshold={final['threshold']:.1f} | "
                       f"{chunks_processed} chunks | {elapsed:.1f}s")
 
         return final
-
-    def _build_result(
-        self, result, chunks_processed: int, early_stopped: bool
-    ) -> dict:
-        """Format the match result into an output dictionary."""
-        time_seconds = (
-            result.offset_frames * self.hop_length / self.sr
-            if result.is_match
-            else None
-        )
-        return {
-            "found": result.is_match,
-            "time_seconds": time_seconds,
-            "match_count": result.match_count,
-            "threshold": result.threshold,
-            "noise_baseline": result.noise_baseline,
-            "chunks_processed": chunks_processed,
-            "early_stopped": early_stopped,
-        }
